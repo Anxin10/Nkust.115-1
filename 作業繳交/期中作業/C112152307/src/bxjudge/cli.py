@@ -1,0 +1,615 @@
+"""bxjudge command line.
+
+Adding a subcommand = one ``_add_<name>(sub)`` function that registers the parser and
+sets ``func`` (taking the parsed ``argparse.Namespace``, returning an int exit code),
+plus one entry in ``_REGISTRARS``.
+"""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from bxjudge import DEFAULT_AUTOCALIB_CONFIG
+
+# C-X5(c): without --autocalib, the repository's config (never the cwd's); an explicit path
+# is used as given.
+_AUTOCALIB_DEFAULT = str(DEFAULT_AUTOCALIB_CONFIG)
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    import cv2
+
+    from bxjudge import calibration  # looked up as attributes so tests can patch them
+
+    out = Path(args.out)
+    frame = calibration.grab_frame(Path(args.video), args.at)
+    c = calibration.interactive_calibrate(frame, args.name)
+    out.mkdir(parents=True, exist_ok=True)
+    png = out / f"{args.name}.png"
+    if not cv2.imwrite(str(png), frame):
+        raise RuntimeError(f"cannot write {png}")
+    c.ref_frame = f"{args.name}.png"  # relative to the JSON's folder
+    json_path = out / f"{args.name}.json"
+    calibration.save_calibration(c, json_path)
+    print(f"saved {json_path} and {png}")
+    return 0
+
+
+def _add_calibrate(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("calibrate", help="click the stadium zones on one video frame")
+    p.add_argument("video", help="video file to take the reference frame from")
+    p.add_argument("--at", type=float, default=1.0, help="seconds into the video (default 1.0)")
+    p.add_argument("--name", required=True, help="calibration name, e.g. 20261001")
+    p.add_argument("--out", default="calib", help="output directory (default calib/)")
+    p.set_defaults(func=_cmd_calibrate)
+
+
+def _cmd_scan(args: argparse.Namespace) -> int:
+    import sys
+
+    from bxjudge import manifest
+
+    folder = Path(args.folder).expanduser()
+    if not folder.is_dir():
+        print(f"error: {folder} is not a folder", file=sys.stderr)
+        return 2
+    failed: list[Path] = []
+
+    def on_error(path: Path, err: Exception) -> None:
+        failed.append(path)
+        print(f"warning: skipped {path}: {err}", file=sys.stderr)
+
+    found = manifest.scan(folder, Path(args.db).expanduser(), on_error=on_error)
+    for i in found:
+        print(f"{i.path.name}  {i.duration:.1f}s  {i.fps:.2f}fps  {i.width}x{i.height}  "
+              f"{i.codec}  audio={'yes' if i.has_audio else 'no'}")
+    print(f"{len(found)} new/changed video(s), {len(failed)} unreadable", file=sys.stderr)
+    return 1 if failed else 0
+
+
+def _add_scan(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("scan", help="list new/changed videos in a folder (does not mark them processed)")
+    p.add_argument("folder", help="folder of synced videos, e.g. ~/bx/videos/20261001")
+    p.add_argument("--db", default="data/processed_videos.json",
+                   help="processed-videos record (default data/processed_videos.json)")
+    p.set_defaults(func=_cmd_scan)
+
+
+from bxjudge.labeling.cli import add_label
+
+
+def _cmd_train(args: argparse.Namespace) -> int:
+    from bxjudge.train import train
+
+    print(train(args.kind, Path(args.dataset), Path(args.out), args.epochs,
+                config=args.config, training_policy=args.training_policy,
+                thresholds=args.thresholds))
+    return 0
+
+
+def _add_train(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("train", help="train one detector on the reviewed COCO dataset")
+    p.add_argument("--kind", required=True, choices=("rfdetr", "yolo26"))
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--out", required=True, help="new isolated run directory")
+    p.add_argument("--epochs", type=int, help="defaults to config training.epochs")
+    p.add_argument("--config", default="config/detection.yaml",
+                   help="detector config; its training block is the production policy")
+    p.add_argument("--training-policy",
+                   help="explicit training policy file instead of the production policy, "
+                        "e.g. config/detection_smoke.yaml (synthetic datasets only)")
+    p.add_argument("--thresholds", default="config/thresholds.yaml",
+                   help="infer_long_edge source for the production training size")
+    p.set_defaults(func=_cmd_train)
+
+
+def _cmd_compare(args: argparse.Namespace) -> int:
+    import json
+
+    from bxjudge.train import compare
+
+    print(json.dumps(compare(
+        {"rfdetr": Path(args.rfdetr), "yolo26": Path(args.yolo26)},
+        Path(args.dataset), output=Path(args.output),
+        selection_out=Path(args.selection_out), config=args.config,
+        thresholds=args.thresholds), indent=2))
+    return 0
+
+
+def _add_compare(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("compare", help="compare both detectors using common COCO validation")
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--rfdetr", required=True, help="trained RF-DETR Nano checkpoint")
+    p.add_argument("--yolo26", required=True, help="trained YOLO26 Nano checkpoint")
+    p.add_argument("--output", default="runs/compare.json")
+    p.add_argument("--selection-out", default="weights/selected.json",
+                   help="selection manifest (synthetic datasets require an isolated path)")
+    p.add_argument("--config", default="config/detection.yaml")
+    p.add_argument("--thresholds", default="config/thresholds.yaml",
+                   help="canonical inference long-edge policy")
+    p.set_defaults(func=_cmd_compare)
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    import logging
+    import sys
+
+    from bxjudge.pipeline import run_batch
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    folder = Path(args.folder).expanduser()
+    try:
+        run_batch(folder, Path(args.calib).expanduser(),
+                  Path(args.out).expanduser() if args.out else Path("results") / folder.name,
+                  selection=Path(args.selection).expanduser(),
+                  thresholds=Path(args.thresholds).expanduser(),
+                  rules_path=Path(args.rules).expanduser(),
+                  detection_config=Path(args.config).expanduser(), limit=args.limit,
+                  vlm_config=None if args.no_vlm else Path(args.vlm_config).expanduser(),
+                  autocalib_config=Path(args.autocalib).expanduser(),
+                  rejudge=args.rejudge,
+                  dynamic_config=Path(args.dynamic_calibration).expanduser() if args.dynamic_calibration else None,
+                  two_bey_config=Path(args.two_bey_tracking).expanduser() if args.two_bey_tracking else None,
+                  trt_manifest=Path(args.trt_manifest).expanduser() if args.trt_manifest else None)
+    except (ValueError, OSError, RuntimeError) as error:
+        if args.debug:
+            raise
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _add_run(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("run", help="judge new/changed videos into a result-local batch")
+    p.add_argument("folder")
+    p.add_argument("--calib", default="calib")
+    p.add_argument("--out", help="defaults to results/<folder name>")
+    p.add_argument("--selection", default="weights/selected.json",
+                   help="explicit selected detector manifest; synthetic output requires review")
+    p.add_argument("--dynamic-calibration", metavar="YAML", help="record moving-stadium geometry, observed launch release and conservative identity evidence")
+    p.add_argument('--two-bey-tracking',metavar='YAML',help='reconstruct at most two physical top identities per round; requires dynamic calibration; no interpolation in adjudication')
+    p.add_argument("--trt-manifest", help="verified RF-DETR TensorRT export manifest (no fallback)")
+    p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.add_argument("--rules", default="config/rules.yaml")
+    p.add_argument("--config", default="config/detection.yaml")
+    p.add_argument("--limit", type=int, help="maximum new/changed videos")
+    p.add_argument("--vlm-config", default="config/vlm.yaml",
+                   help="local VLM second opinion after judging (its after_run key enables it)")
+    p.add_argument("--no-vlm", action="store_true", help="skip the VLM phase")
+    p.add_argument("--autocalib", default=_AUTOCALIB_DEFAULT,
+                   help="auto-calibration policy for videos no manual calibration matches")
+    p.add_argument("--rejudge", action="store_true",
+                   help="ignore the processed cache and re-analyse every video (reviewed rows "
+                        "are kept); records the wall times speed needs (R66b)")
+    p.set_defaults(func=_cmd_run)
+
+
+def _load_truth(path: Path):
+    """The ``--truth`` manual calibration; a malformed file (missing zones, wrong shapes, a
+    non-positive frame size, a polygon with fewer than 3 points) is a ``ValueError`` naming
+    the file, so the CLI prints an ``error:`` line and exits 2 (final review N1)."""
+    from bxjudge.calibration import ZONES, load_calibration
+
+    try:
+        truth = load_calibration(path)
+    except (KeyError, TypeError, AttributeError, ValueError) as e:
+        raise ValueError(f"{path}: --truth is not a calibration JSON "
+                         f"({type(e).__name__}: {e})") from None
+    if min(truth.frame_size) <= 0:
+        raise ValueError(f"{path}: --truth frame_size must be positive, "
+                         f"got {list(truth.frame_size)}")
+    short = [z for z, _en, _zh in ZONES if len(getattr(truth, z)) < 3]
+    if short:
+        raise ValueError(f"{path}: --truth polygons need >= 3 points: {short}")
+    return truth
+
+
+def _cmd_autocalib(args: argparse.Namespace) -> int:
+    import sys
+
+    from bxjudge import manifest
+    from bxjudge.autocalib import load_autocalib_config, mean_boundary_error
+    from bxjudge.calibration_store import (
+        select_snapshot,
+        validate_output_paths,
+        write_preview,
+    )
+    from bxjudge.config import load_thresholds
+    from bxjudge.pipeline import first_second_frame
+    from bxjudge.video import VideoDecodeError
+
+    th = load_thresholds(Path(args.thresholds).expanduser())
+    cfg = load_autocalib_config(Path(args.autocalib).expanduser())
+    calib_dir = Path(args.calib).expanduser()
+    if not calib_dir.is_dir():  # a typo must not silently turn every video into recalibrate
+        raise ValueError(f"{calib_dir}: --calib is not a folder")
+    out_dir = Path(args.out).expanduser()  # scratch results folder: --calib is only ever read
+    validate_output_paths(out_dir, calib_dir)
+    truth = _load_truth(Path(args.truth).expanduser()) if args.truth else None
+    counts = {"PASS": 0, "FAIL": 0, "REJECTED": 0}
+    errors = 0
+    for video in map(Path, args.videos):
+        video = video.expanduser()
+        try:
+            info = manifest.probe(video)
+            frame = first_second_frame(info, th)
+            snap = select_snapshot(frame, calib_dir, out_dir, th, cfg)
+            preview = write_preview(out_dir, snap) if snap is not None else None
+        except (ValueError, OSError, VideoDecodeError) as error:
+            errors += 1
+            print(f"error: {video}: {error}", file=sys.stderr)
+            continue
+        if snap is None:
+            line = f"{video.name}: recalibrate name=- score=-"
+        else:
+            line = (f"{video.name}: {snap.kind} name={snap.calibration.name} "
+                    f"score={snap.score:.3f} id={snap.id} preview={preview}")
+        if truth is not None:
+            if snap is None:  # no calibration produced: not evidence that anything aligns
+                status, shown = "REJECTED", "-"
+            else:
+                err = mean_boundary_error(snap.calibration, truth, th.infer_long_edge)
+                status = "PASS" if err < cfg.max_boundary_error_px else "FAIL"
+                shown = f"{err:.2f}"
+            counts[status] += 1
+            line += f" boundary_error_px={shown} {status}"
+        print(line)
+    if truth is not None:
+        print(f"PASS {counts['PASS']} / FAIL {counts['FAIL']} / REJECTED {counts['REJECTED']}")
+    if errors:
+        return 2
+    rejected = counts["REJECTED"] and not args.allow_recalibrate
+    return 1 if counts["FAIL"] or rejected else 0
+
+
+def _add_autocalib(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "autocalib",
+        help="preview/accept auto-calibration per video: manual | auto | recalibrate "
+             "(read-only on --calib; snapshots and previews go to --out)")
+    p.add_argument("videos", nargs="+", help="video files (first-second frame is judged)")
+    p.add_argument("--calib", default="calib", help="manual calibrations (read only)")
+    p.add_argument("--out", required=True,
+                   help="scratch results-style folder for calibrations/<id>.json|png|preview.jpg")
+    p.add_argument("--truth", help="manual calibration JSON (keep it OUTSIDE --calib) applied to "
+                                   "every video given; prints boundary_error_px PASS|FAIL "
+                                   "(at or above max_boundary_error_px) or REJECTED (recalibrate); "
+                                   "exit 1 on any FAIL or REJECTED")
+    p.add_argument("--allow-recalibrate", action="store_true",
+                   help="with --truth: REJECTED (recalibrate) videos do not fail the run "
+                        "(transparent floors may legitimately end up recalibrate)")
+    p.add_argument("--autocalib", default=_AUTOCALIB_DEFAULT)
+    p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.set_defaults(func=_cmd_autocalib)
+
+
+def _cmd_vlm(args: argparse.Namespace) -> int:
+    import json
+    import logging
+    import sys
+    import time
+    import uuid
+    from datetime import datetime
+
+    from bxjudge import vlm
+    from bxjudge.autocalib import load_autocalib_config
+    from bxjudge.config import load_thresholds
+    from bxjudge.output import record_run_timing
+    from bxjudge.rules import load_rules
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    results = Path(args.results).expanduser()
+    began = time.perf_counter()
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    run_id = uuid.uuid4().hex  # C-X4(b): links the VLM timings to this phase's record
+    try:
+        if not results.is_dir():
+            raise ValueError(f"{results}: expected a results directory")
+        config = vlm.load_vlm_config(Path(args.config).expanduser())
+        summary = vlm.review_results_dir(
+            results,
+            th=load_thresholds(Path(args.thresholds).expanduser()),
+            rules=load_rules(Path(args.rules).expanduser()),
+            config=config,
+            autocalib=load_autocalib_config(Path(args.autocalib).expanduser()),
+            run_id=run_id,
+        )
+        if summary.get("skipped"):  # R65: nothing asked, so no VLM run is recorded
+            print(f"warning: VLM phase skipped, {config.host} unreachable; start the local "
+                  "Ollama (README 完整流程) and rerun `bxjudge vlm`", file=sys.stderr)
+        if summary.get("asked"):
+            wall = time.perf_counter() - began  # R61: standalone VLM phase wall-clock
+            record_run_timing(results, kind="vlm", run_id=run_id, started_at=started_at,
+                              wall_s=wall, vlm_wall_s=wall, videos={})
+    except (ValueError, OSError, RuntimeError) as error:
+        if args.debug:
+            raise
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(summary, ensure_ascii=False))
+    return 0
+
+
+def _add_vlm(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("vlm", help="ask the local VLM about unreviewed review-required rounds")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--config", default="config/vlm.yaml")
+    p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.add_argument("--rules", default="config/rules.yaml")
+    p.add_argument("--autocalib", default=_AUTOCALIB_DEFAULT,
+                   help="auto-calibration config: snapshot file bounds (C-X3(b))")
+    p.set_defaults(func=_cmd_vlm)
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    import os
+    import subprocess
+    import sys
+
+    results = Path(args.results).expanduser().resolve()
+    if not (results / "rounds.json").is_file():
+        print(f"error: {results} has no rounds.json (run `bxjudge run` first)", file=sys.stderr)
+        return 2
+    app = Path(__file__).with_name("review_app.py")
+    argv = [
+        sys.executable, "-m", "streamlit", "run", str(app),
+        "--server.address", "127.0.0.1",  # loopback only: never reachable from the LAN
+        "--server.port", str(args.port),
+        "--server.headless", "true",
+        "--browser.gatherUsageStats", "false",
+        "--",
+        str(results),
+        "--rules", str(Path(args.rules).expanduser().resolve()),
+        "--thresholds", str(Path(args.thresholds).expanduser().resolve()),
+        "--autocalib", str(Path(args.autocalib).expanduser().resolve()),
+    ]
+    env = {**os.environ, "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false"}
+    print(f"review UI: http://127.0.0.1:{args.port}  (Ctrl+C to stop)", file=sys.stderr)
+    return subprocess.call(argv, env=env)
+
+
+def _add_review(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("review", help="local web UI to review and correct judged rounds")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--port", type=int, default=8501, help="loopback port (default 8501)")
+    p.add_argument("--rules", default="config/rules.yaml")
+    p.add_argument("--thresholds", default="config/thresholds.yaml")
+    p.add_argument("--autocalib", default=_AUTOCALIB_DEFAULT,
+                   help="auto-calibration config: snapshot file bounds (C-X3(b))")
+    p.set_defaults(func=_cmd_review)
+
+
+def _eval_inputs(args: argparse.Namespace):
+    """Prediction rows/timings, optionally with R37 reference truth applied (read-only)."""
+    from bxjudge import evaluate as ev
+
+    cfg = ev.load_eval_config(Path(args.config).expanduser())
+    results = Path(args.results).expanduser()
+    rows, timings, runs = ev.read_results(results)
+    truth = None
+    if args.truth:
+        truth_rows, _, _ = ev.read_results(Path(args.truth).expanduser())
+        truth = ev.match_truth(rows, truth_rows, cfg.truth_t_launch_tolerance_s)
+        rows = truth.rows
+    return cfg, results, rows, timings, runs, truth
+
+
+def _report_path(args: argparse.Namespace, kind: str) -> tuple[Path, str]:
+    from datetime import date
+
+    today = f"{date.today():%Y%m%d}"
+    if args.report:
+        return Path(args.report).expanduser(), today
+    return Path("reports") / f"{kind}-{today}.md", today
+
+
+def _write_report(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    import math
+    import sys
+
+    from bxjudge import evaluate as ev
+    from bxjudge.calibration_store import vetoed_ids
+    from bxjudge.rules import load_rules
+
+    try:
+        cfg, results, rows, timings, runs, truth = _eval_inputs(args)
+        rules = load_rules(Path(args.rules).expanduser())
+        vetoed = vetoed_ids(results)
+        audit = ev.read_audit(results)
+        metrics = ev.evaluate(rows, timings, config=cfg, runs=runs, vetoed=vetoed, audit=audit)
+        ok = ev.passes(metrics, cfg)
+        extra = ev.report_metrics(rows, timings, cfg, rules=rules, runs=runs, vetoed=vetoed,
+                               audit=audit)
+        path, today = _report_path(args, "eval")
+        _write_report(path, ev.render_eval_report(
+            results, rows, timings, metrics, ok, extra, cfg, truth=truth,
+            truth_dir=Path(args.truth).expanduser() if args.truth else None, today=today,
+            vetoed=vetoed))
+    except (ValueError, OSError, KeyError) as error:
+        if args.debug:
+            raise
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    def shown(name: str) -> str:
+        value = getattr(metrics, name)
+        return f"{value:.3f}" if math.isfinite(value) else "unverified"
+
+    summary = ", ".join(f"{name}={shown(name)} {ok[name]}"
+                        for name in ev.METRIC_NAMES)
+    print(f"{summary}; reviewed={metrics.n_reviewed}/{metrics.n_rounds}")
+    trade = extra.tradeoff  # R67: conservative lower bound, exact only with full truth
+    covered, real = trade["truth_coverage"]
+    overall = (f"{trade['overall_accuracy']:.3f}" if trade["overall_accuracy"] is not None
+               else f"unverified (truth coverage {covered}/{real})")
+    lower = (f"{trade['accuracy_lower_bound']:.3f}"
+             if math.isfinite(trade["accuracy_lower_bound"]) else "n/a")
+    print(f"accuracy_lower_bound={lower}; "
+          f"overall_accuracy={overall}")
+    if metrics.speed_slowest_video is not None:  # R66: name the video that decides speed
+        print(f"speed [{metrics.speed_basis}]: slowest video {metrics.speed_slowest_video} "
+              f"at {metrics.speed_ratio_worst_observed:.3f} x playback")
+    if metrics.n_wall_missing:
+        print(f"speed unverified (not a pass): {metrics.n_wall_missing} real video(s) without "
+              f"wall times; re-judge them with `{ev.REJUDGE_REMEDY}`")
+    if metrics.finish_accuracy_unflagged_method == "invalidated":
+        print("INVALIDATED: sampled rounds changed since the audit sample was drawn; run `"
+              f"{ev.audit_remedy(results, audit['n'], audit['seed'])}`")
+    if ev.is_synthetic(rows):
+        print("SMOKE ONLY: synthetic-detector rounds are not acceptance evidence")
+    print(f"report: {path}")
+    return 0
+
+
+def _add_eval(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("eval", help="spec section 11 metrics from reviewed rounds (read-only)")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--truth", help="explicit reviewed reference results directory used as "
+                                   "truth for these (fresh) predictions; read-only (R37)")
+    p.add_argument("--config", default="config/evaluation.yaml")
+    p.add_argument("--rules", default="config/rules.yaml", help="for match score agreement")
+    p.add_argument("--report", help="report path (default reports/eval-YYYYMMDD.md)")
+    p.set_defaults(func=_cmd_eval)
+
+
+def _cmd_tune(args: argparse.Namespace) -> int:
+    import sys
+
+    from bxjudge import evaluate as ev
+    from bxjudge.config import load_thresholds
+
+    try:
+        cfg, results, rows, _, _, truth = _eval_inputs(args)
+        th_path = Path(args.thresholds).expanduser()
+        th = load_thresholds(th_path)
+        samples = ev.shake_samples(rows, th.impact_coincide_frames)
+        derivation = ev.derive_shake(samples.samples, cfg.shake_overlap_percentile)
+        diff = ("" if derivation.method == "insufficient"
+                else ev.thresholds_diff(th_path, "shake_px", derivation.value))
+        path, today = _report_path(args, "tune")
+        _write_report(path, ev.render_tune_report(
+            results, rows, samples, derivation, diff, th.shake_px,
+            ev.spin_dir_check(rows, cfg.spin_min_samples), ev.reversed_finish_check(rows),
+            impact_coincide_frames=th.impact_coincide_frames, thresholds_path=th_path,
+            truth=truth, today=today))
+    except (ValueError, OSError, KeyError) as error:
+        if args.debug:
+            raise
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(diff.rstrip() if diff else f"shake_px: no change proposed ({derivation.method})")
+    print(f"advisory only, {th_path} not modified; report: {path}")
+    return 0
+
+
+def _add_tune(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("tune", help="advisory shake_px / spin-direction checks from reviewed rounds")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--truth", help="explicit reviewed reference results directory (R37)")
+    p.add_argument("--thresholds", default="config/thresholds.yaml",
+                   help="current thresholds (read only; the diff is printed, never applied)")
+    p.add_argument("--config", default="config/evaluation.yaml")
+    p.add_argument("--report", help="report path (default reports/tune-YYYYMMDD.md)")
+    p.set_defaults(func=_cmd_tune)
+
+
+def _cmd_audit_sample(args: argparse.Namespace) -> int:
+    import sys
+
+    from bxjudge.corrections import CorrectionError, mark_audit_sample
+    from bxjudge.rules import load_rules
+
+    try:
+        picked = mark_audit_sample(Path(args.results).expanduser(), args.n, seed=args.seed,
+                                   replace=args.replace,
+                                   rules=load_rules(Path(args.rules).expanduser()))
+    except (CorrectionError, ValueError, OSError) as error:
+        if args.debug:
+            raise
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    for video, number in picked:
+        print(f"{video}\t{number}")
+    print(f"{len(picked)} unflagged round(s) in the audit sample (seed {args.seed}); review "
+          "them all with the 抽樣稽核 filter in `bxjudge review`")
+    return 0
+
+
+def _add_audit_sample(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("audit-sample",
+                       help="mark a seeded random sample of unflagged rounds for audit review")
+    p.add_argument("results", help="results directory written by `bxjudge run`")
+    p.add_argument("--n", type=int, required=True, help="sample size")
+    p.add_argument("--seed", type=int, required=True, help="random seed (reproducible)")
+    p.add_argument("--rules", default="config/rules.yaml")
+    p.add_argument("--replace", action="store_true",
+                   help="replace an existing sample (required when the population changed)")
+    p.set_defaults(func=_cmd_audit_sample)
+
+
+_REGISTRARS = [_add_calibrate, _add_scan, add_label, _add_train, _add_compare, _add_run,
+               _add_autocalib, _add_vlm, _add_review, _add_eval, _add_tune, _add_audit_sample]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="bxjudge", description="Local AI referee for Beyblade X videos")
+    parser.add_argument("--debug", action="store_true",
+                        help="show the full traceback instead of a one-line error")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for register in _REGISTRARS:
+        register(sub)
+    _debug_anywhere(sub)
+    return parser
+
+
+def _debug_anywhere(sub: argparse._SubParsersAction) -> None:
+    """Accept ``--debug`` after any (nested) subcommand too. ``SUPPRESS`` keeps a value given
+    before the subcommand from being overwritten by the subparser's default."""
+    for parser in sub.choices.values():
+        parser.add_argument("--debug", action="store_true", default=argparse.SUPPRESS,
+                            help="show the full traceback instead of a one-line error")
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                _debug_anywhere(action)
+
+
+def _user_errors() -> tuple[type[BaseException], ...]:
+    """Exceptions that mean the user's input is wrong, not that the program is.
+
+    - ``OSError``: missing / unreadable / unwritable paths (FileNotFoundError, ...).
+    - ``yaml.YAMLError``: malformed YAML outside a config loader.
+    - ``ValueError``: invalid values; every config loader reports wrong values AND wrong
+      shapes (the TypeError/KeyError its validation hits) as ``config.ConfigError``,
+      a ValueError naming the file. JSON decode errors and CorrectionError are ValueErrors.
+
+    Deliberately NOT caught: TypeError, KeyError, AttributeError, RuntimeError (CUDA, ...)
+    raised outside config loading: those are bugs or environment faults whose traceback
+    is the evidence needed to fix them.
+    """
+    import yaml
+
+    return (OSError, yaml.YAMLError, ValueError)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import sys
+
+    args = build_parser().parse_args(argv)
+    try:
+        return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        print("cancelled", file=sys.stderr)
+        return 130
+    except _user_errors() as error:
+        if args.debug:
+            raise
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

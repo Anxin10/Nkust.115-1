@@ -1,1 +1,1 @@
-https://github.com/fs-tw/Further.InspectPlan
+https://github.com/yinchang0626/Nkust.InspectPlan

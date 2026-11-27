@@ -1,5 +1,5 @@
 # BXJudge｜Beyblade X 影片輔助裁判
-
+https://github.com/Anxin10/bxjudge.git
 BXJudge 是一個在本機分析 Beyblade X 比賽影片的電腦視覺專案。它把比賽畫面整理成可檢查的軌跡與事件，協助裁判回看高速移動、碰撞與入袋的片段。
 
 - **場地與陀螺辨識**：定位戰鬥區與得分袋，追蹤兩顆陀螺的位置及身分。
